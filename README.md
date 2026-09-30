@@ -3,11 +3,34 @@
 Reusable GitHub Actions workflows for putting st44 sites live. One copy, called
 by every site, instead of ~110 lines of `deploy.yml` duplicated per repository.
 
-This repository is **private**. A private repository's reusable workflows are
-callable from other repositories owned by the same account once *Settings →
-Actions → General → Access* is set to **"Accessible from repositories owned by
-the user 'tidemann'"**. That is already set here. Nothing in this repository is
-readable by anyone outside the account.
+## Who can call this — measured, not assumed
+
+This repository is **private**, and *Settings → Actions → General → Access* is
+set to **"Accessible from repositories owned by the user 'tidemann'"**
+(`access_level: user`).
+
+That is necessary but **not sufficient**. The rule, established by running it
+rather than by reading the docs:
+
+| Calling repository | Result                                           |
+| ------------------ | ------------------------------------------------ |
+| private, owned by `tidemann` | ✅ the call resolves and runs           |
+| public, owned by `tidemann`  | ❌ the run fails at startup, before any job |
+
+A **public** repository cannot call a reusable workflow in a **private** one,
+even within the same account and with access set to `user`. The run fails
+immediately with no jobs and no log — there is no error message to read, which
+is why this is written down here.
+
+So a site repository must be private to call this, or this repository must be
+public. `tidemann/food-st44` is public today, which is why it does not call this
+yet.
+
+Evidence (2026-09-30): an identical two-line probe workflow, calling the same
+trivial reusable workflow at the same ref, failed at startup from the public
+`tidemann/food-st44` and succeeded from a private repository in the same
+account. An inline control job on the same branch of `food-st44` was green, so
+the branch, the trigger and the file were all fine.
 
 ## build-and-deploy
 
