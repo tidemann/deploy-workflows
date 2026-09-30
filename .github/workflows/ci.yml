@@ -1,0 +1,64 @@
+name: CI
+
+# This repository ships nothing but workflows, so CI's job is to catch a broken
+# workflow here rather than in the calling repo's deploy run.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate workflows
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Required files exist
+        run: |
+          set -euo pipefail
+          for f in README.md LICENSE .github/workflows/build-and-deploy.yml; do
+            test -s "$f" || { echo "::error::missing or empty: $f"; exit 1; }
+          done
+
+      # actionlint parses the workflow, type-checks expressions and runs
+      # shellcheck over every `run:` block.
+      - name: actionlint
+        run: |
+          set -euo pipefail
+          VERSION=1.7.7
+          SHA256=023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
+          curl -fsSL -o actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${VERSION}/actionlint_${VERSION}_linux_amd64.tar.gz"
+          echo "${SHA256}  actionlint.tar.gz" | sha256sum -c -
+          tar -xzf actionlint.tar.gz actionlint
+          ./actionlint -color
+
+      # A calling repo pins @v1. If someone adds a third-party action without a
+      # SHA, every caller silently follows a moving reference.
+      - name: Third-party actions are pinned by SHA
+        run: |
+          set -euo pipefail
+          bad=0
+          while read -r line; do
+            ref="${line#*uses:}"
+            ref="$(printf '%s' "$ref" | tr -d ' ')"
+            case "$ref" in
+              ./*) continue ;;
+            esac
+            version="${ref#*@}"
+            if ! printf '%s' "$version" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error::not pinned by SHA: $ref"
+              bad=1
+            fi
+          done < <(grep -rhE '^\s*-?\s*uses:' .github/workflows)
+          exit "$bad"

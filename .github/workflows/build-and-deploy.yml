@@ -1,0 +1,262 @@
+name: Build and deploy
+
+# Reusable deploy route for st44 sites.
+#
+# Build the image in CI, push it to GHCR tagged by commit SHA, then SSH to the
+# server and run compose there. The GHCR package stays private: the registry
+# credential lives on the host, in the deploy user's docker config, and never
+# travels through this workflow. CI never ships image bytes to the server.
+#
+# Calling repos pin this by tag (@v1), never by @main — see README.md.
+
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        description: >-
+          Short name of the site. Used for the GHCR image name, the compose
+          service and container name, the default remote directory and the
+          concurrency group. Example: food-st44.
+        required: true
+        type: string
+      site-host:
+        description: >-
+          Public hostname the site must answer on, without scheme.
+          Example: food.st44.no.
+        required: true
+        type: string
+      remote-dir:
+        description: >-
+          Directory on the server that holds the compose file.
+          Defaults to /srv/apps/<app-name>/infra.
+        required: false
+        type: string
+        default: ""
+      compose-file:
+        description: Path to the compose file in the calling repository.
+        required: false
+        type: string
+        default: infra/docker-compose.yml
+      image-tag:
+        description: >-
+          Tag to publish and deploy. Defaults to the full commit SHA, which is
+          what makes a deploy identifiable and rollback-able. Override only for
+          a deliberate re-tag.
+        required: false
+        type: string
+        default: ""
+    secrets:
+      DEPLOY_KEY:
+        description: Private SSH key for the deploy user on the server.
+        required: true
+      SERVER_HOST:
+        description: Hostname or IP of the server.
+        required: true
+      SERVER_USER:
+        description: Deploy user on the server.
+        required: true
+
+# Least privilege at the top; the build job adds packages:write for GHCR.
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-${{ inputs.app-name }}
+  cancel-in-progress: false
+
+jobs:
+  # Build once. The deploy job promotes this exact tag — it never rebuilds.
+  build:
+    name: Build and push image
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.identity.outputs.image }}
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      # Named once, so no later step has to re-derive it and get it subtly wrong.
+      - name: Image identity
+        id: identity
+        run: |
+          set -euo pipefail
+          tag='${{ inputs.image-tag }}'
+          [ -n "$tag" ] || tag="$GITHUB_SHA"
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER}/${{ inputs.app-name }}:${tag}"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "$image"
+        env:
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      # GITHUB_TOKEN publishes into the calling repository's own package
+      # namespace. A package created this way is private by default and stays
+      # private unless someone changes it by hand — which is the point here.
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.identity.outputs.image }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to ${{ inputs.site-host }}
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      IMAGE: ${{ needs.build.outputs.image }}
+      SITE_HOST: ${{ inputs.site-host }}
+      APP_NAME: ${{ inputs.app-name }}
+      COMPOSE_FILE_PATH: ${{ inputs.compose-file }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Resolve the remote directory
+        run: |
+          set -euo pipefail
+          dir='${{ inputs.remote-dir }}'
+          [ -n "$dir" ] || dir="/srv/apps/${APP_NAME}/infra"
+          echo "REMOTE_DIR=$dir" >> "$GITHUB_ENV"
+          echo "$dir"
+
+      # One ssh alias, so the host and user are named once and no later step has
+      # to re-interpolate a secret into a command line.
+      - name: Configure ssh
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.DEPLOY_KEY }}" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+
+          # StrictHostKeyChecking=yes, so a swapped host key fails the deploy
+          # rather than silently trusting a new one.
+          ssh-keyscan -H '${{ secrets.SERVER_HOST }}' >> ~/.ssh/known_hosts
+          test -s ~/.ssh/known_hosts
+
+          cat > ~/.ssh/config <<EOF
+          Host deploy-target
+            HostName ${{ secrets.SERVER_HOST }}
+            User ${{ secrets.SERVER_USER }}
+            IdentityFile ~/.ssh/id_deploy
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+            BatchMode yes
+          EOF
+          chmod 600 ~/.ssh/config
+
+      # Rollback anchor: name the artifact running now, before replacing it.
+      # Recorded first so a later failure still leaves the previous image named.
+      - name: Record the currently deployed image
+        run: |
+          set -euo pipefail
+          ssh deploy-target "docker inspect -f '{{.Config.Image}} {{.Image}}' '${APP_NAME}' 2>/dev/null || echo 'none (first deployment)'" \
+            | tee previous-image.txt
+
+      # `mkdir -p` creates infra/ on a first deploy and is a no-op afterwards, so
+      # nobody pre-creates it by hand. It cannot grant itself permission, so name
+      # the missing prerequisite out loud when that is what failed.
+      - name: Create the deploy directory
+        run: |
+          set -euo pipefail
+          if ! ssh deploy-target "mkdir -p '${REMOTE_DIR}'"; then
+            echo "::error::could not create ${REMOTE_DIR} — the deploy user needs a writable parent directory"
+            exit 1
+          fi
+          ssh deploy-target "test -w '${REMOTE_DIR}'"
+
+      # The compose file names the image as ${IMAGE}; the .env beside it supplies
+      # the value. That is what lets one compose file serve every deploy while
+      # the tag stays immutable and per-commit.
+      - name: Ship the compose file
+        run: |
+          set -euo pipefail
+          test -f "${COMPOSE_FILE_PATH}" || {
+            echo "::error::compose file not found in this repository: ${COMPOSE_FILE_PATH}"
+            exit 1
+          }
+          scp "${COMPOSE_FILE_PATH}" "deploy-target:${REMOTE_DIR}/docker-compose.yml"
+          printf 'IMAGE=%s\n' "${IMAGE}" > deploy.env
+          scp deploy.env "deploy-target:${REMOTE_DIR}/.env"
+
+      # The pull runs as the deploy user on the host, which holds the GHCR
+      # credential. That is the whole point of the SSH route.
+      - name: Pull and start
+        run: |
+          set -euo pipefail
+          ssh deploy-target "cd '${REMOTE_DIR}' && docker compose pull && docker compose up -d --force-recreate"
+
+      - name: Show container state
+        run: |
+          set -euo pipefail
+          ssh deploy-target "docker ps --filter name='${APP_NAME}' --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'"
+
+      # Checked by service name over the shared proxy network, not over loopback:
+      # container loopback belongs to that container, and the proxy reaches this
+      # service the same way this check does.
+      - name: Verify healthz on the proxy network
+        run: |
+          set -euo pipefail
+          ssh deploy-target APP_NAME="${APP_NAME}" bash -s <<'REMOTE'
+          set -uo pipefail
+          for i in $(seq 1 30); do
+            body="$(docker exec "$APP_NAME" wget -qO- "http://${APP_NAME}:80/healthz" 2>/dev/null || true)"
+            if [ "$(printf '%s' "$body" | tr -d '[:space:]')" = "ok" ]; then
+              echo "internal healthz: ok"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "$APP_NAME never answered ok on http://${APP_NAME}:80/healthz"
+          docker logs --tail 50 "$APP_NAME" 2>&1 || true
+          exit 1
+          REMOTE
+
+      # Only true once the proxy has a vhost and a valid certificate for the
+      # hostname. A green container is not a finished deploy.
+      - name: Verify https://<site-host>/healthz
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            # curl already reports 000 for a connection or TLS failure; `|| true`
+            # only stops `set -e` from aborting the retry loop.
+            code="$(curl -sS -o body.txt -w '%{http_code}' "https://${SITE_HOST}/healthz" || true)"
+            if [ "$code" = "200" ] && [ "$(tr -d '[:space:]' < body.txt)" = "ok" ]; then
+              echo "public healthz: 200 ok over valid TLS"
+              exit 0
+            fi
+            echo "attempt $i: http=$code"
+            sleep 10
+          done
+          echo "::error::https://${SITE_HOST}/healthz did not return 200 ok with valid TLS"
+          curl -sSv "https://${SITE_HOST}/healthz" || true
+          exit 1
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### ${APP_NAME} deploy"
+            echo
+            echo "- Image: \`${IMAGE}\`"
+            echo "- Digest: \`${{ needs.build.outputs.digest }}\`"
+            echo "- Remote path: \`${REMOTE_DIR}\`"
+            echo "- Public health check: https://${SITE_HOST}/healthz"
+            echo "- Previous image (rollback anchor): \`$(cat previous-image.txt 2>/dev/null || echo unknown)\`"
+          } >> "$GITHUB_STEP_SUMMARY"
