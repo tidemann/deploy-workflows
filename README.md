@@ -3,34 +3,53 @@
 Reusable GitHub Actions workflows for putting st44 sites live. One copy, called
 by every site, instead of ~110 lines of `deploy.yml` duplicated per repository.
 
-## Who can call this — measured, not assumed
+## Why this repository is public
 
-This repository is **private**, and *Settings → Actions → General → Access* is
-set to **"Accessible from repositories owned by the user 'tidemann'"**
-(`access_level: user`).
-
-That is necessary but **not sufficient**. The rule, established by running it
-rather than by reading the docs:
-
-| Calling repository | Result                                           |
-| ------------------ | ------------------------------------------------ |
-| private, owned by `tidemann` | ✅ the call resolves and runs           |
-| public, owned by `tidemann`  | ❌ the run fails at startup, before any job |
+This repository is **public**. That was a deliberate decision, not a default,
+and this is the reason:
 
 A **public** repository cannot call a reusable workflow in a **private** one,
-even within the same account and with access set to `user`. The run fails
-immediately with no jobs and no log — there is no error message to read, which
-is why this is written down here.
+even within the same account and even with *Settings → Actions → General →
+Access* set to `user`. The run fails immediately with no jobs and no log — there
+is no error message to read anywhere, which is why it is written down here.
+Measured, not read in the docs:
 
-So a site repository must be private to call this, or this repository must be
-public. `tidemann/food-st44` is public today, which is why it does not call this
-yet.
+| Reusable workflow's repo | Calling repository          | Result                              |
+| ------------------------ | --------------------------- | ----------------------------------- |
+| private                  | private, owned by `tidemann` | ✅ the call resolves and runs        |
+| private                  | public, owned by `tidemann`  | ❌ fails at startup, before any job  |
+| public (today)           | public, owned by `tidemann`  | ✅ the call resolves and runs        |
 
-Evidence (2026-09-30): an identical two-line probe workflow, calling the same
-trivial reusable workflow at the same ref, failed at startup from the public
+Evidence (2026-09-30): an identical two-line probe workflow calling the same
+trivial reusable workflow at the same ref failed at startup from the public
 `tidemann/food-st44` and succeeded from a private repository in the same
 account. An inline control job on the same branch of `food-st44` was green, so
-the branch, the trigger and the file were all fine.
+the branch, the trigger and the file were all fine. After this repository was
+made public, the same call from `food-st44` went green.
+
+The site repositories are public, so the choice was to make every site private
+or to make this repository public. Nothing secret lives here — the workflow
+reads its host, user and key from the **calling** repository's secrets, and the
+GHCR packages it pushes stay **private**. Public here costs nothing; private
+sites would have cost the sites their visibility.
+
+`main` is protected: pull request required, `ci` required, force-push and
+deletion blocked.
+
+## What a calling repository needs before its first run
+
+The three secrets must exist on the calling repository **before** the first
+call. With `secrets: inherit`, a missing required secret fails the whole run
+before any job starts:
+
+```
+Error when evaluating 'secrets'.
+Secret DEPLOY_KEY is required, but not provided while calling.
+```
+
+That error names the missing secrets, so it is legible — unlike the private/
+public failure above. `agent-deploy-key` sets all three; run it for the site
+first.
 
 ## build-and-deploy
 
