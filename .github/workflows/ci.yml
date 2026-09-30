@@ -51,7 +51,9 @@ jobs:
           bad=0
           while read -r line; do
             ref="${line#*uses:}"
-            ref="$(printf '%s' "$ref" | tr -d ' ')"
+            # Drop the trailing `# v5` version comment before looking at the ref.
+            ref="${ref%%#*}"
+            ref="$(printf '%s' "$ref" | tr -d '[:space:]')"
             case "$ref" in
               ./*) continue ;;
             esac
