@@ -127,7 +127,24 @@ All three are required, and all three are what `agent-deploy-key` mints and sets
 3. An image that has `wget` available (the health check runs
    `docker exec <app-name> wget -qO- http://<app-name>:80/healthz`).
 
-A worked example lives in `tidemann/food-st44`.
+A worked example lives in `tidemann/food-st44`, which is the first live caller:
+its whole `.github/workflows/deploy.yml` is the five-line block above, and the
+155-line copy it replaced is gone. Proven green end to end on
+[run 36730946719](https://github.com/tidemann/food-st44/actions/runs/36730946719)
+and again on the next merge,
+[run 36731501568](https://github.com/tidemann/food-st44/actions/runs/36731501568),
+which recorded the first run's image as its rollback anchor — so the anchor
+chains across deploys rather than only being printed.
+
+One thing a caller has to get right that is easy to miss: the calling workflow
+needs `permissions: packages: write` at its top level. A called workflow cannot
+grant itself more than its caller holds, so without it the build job cannot push
+to GHCR.
+
+A caller should also stop publishing the image from its own CI. This workflow is
+the publisher; a CI job that still pushes the same SHA tag on a push to `main`
+makes two publishers race for one tag. Keep CI's build as a smoke test with
+`push: false` and drop its `packages: write`.
 
 ### What it does, in order
 
