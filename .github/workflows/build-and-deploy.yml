@@ -8,6 +8,15 @@ name: Build and deploy
 # travels through this workflow. CI never ships image bytes to the server.
 #
 # Calling repos pin this by tag (@v1), never by @main — see README.md.
+#
+# One repo does not call this: st44-home keeps its own copy in
+# .github/workflows/deploy.yml, because it is a three-image stack and this builds
+# one image. The two are twins, so a fix here — an action bump, a permissions
+# tightening, an ssh change — very probably belongs there too, and the other way
+# round. ST-53 and ST-59 both had to be applied twice.
+#
+# ST-63 decided to extend this workflow to N images "later", triggered by a fourth
+# repo needing the deploy path or by the third fix that has to land in both copies.
 
 on:
   workflow_call:
