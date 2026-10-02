@@ -19,6 +19,11 @@ name: Build and deploy
 # key has been tightened yet, so the workflow and the key can be switched in
 # either order without a broken deploy in between.
 #
+# Once a site's key is tightened, the caller turns on verify-forced-command, and
+# every deploy afterwards proves the key can only run deploy.sh — a shell
+# command, a read of another site's compose and an scp are all asserted to be
+# refused, failing the run if any of them works.
+#
 # Calling repos pin this by tag (@v1), never by @main — see README.md.
 #
 # One repo does not call this: st44-home keeps its own copy in
@@ -72,6 +77,24 @@ on:
           Tag to publish and deploy. Defaults to the full commit SHA, which is
           what makes a deploy identifiable and rollback-able. Override only for
           a deliberate re-tag.
+        required: false
+        type: string
+        default: ""
+      verify-forced-command:
+        description: >-
+          When true, after the deploy, use the deploy key to attempt 'id', a
+          read of another site's compose file, and an scp, asserting each is
+          refused. This proves the key is really forced to deploy.sh and fails
+          the run if it is not. Turn it on only after the site's key has been
+          re-minted with the forced command.
+        required: false
+        type: boolean
+        default: false
+      verify-other-site-path:
+        description: >-
+          Path on the server to attempt reading when verify-forced-command is
+          true — another site's compose file, the cross-site case a leaked key
+          must not reach. Optional: if empty, the cross-site read is skipped.
         required: false
         type: string
         default: ""
@@ -246,6 +269,50 @@ jobs:
           echo "::error::https://${SITE_HOST}/healthz did not return 200 ok with valid TLS"
           curl -sSv "https://${SITE_HOST}/healthz" || true
           exit 1
+
+      # A forced command only buys anything if it bites. With the site's key in
+      # hand, prove the key cannot do anything but run deploy.sh: a shell
+      # command, a read of another site's compose file, and an scp must all be
+      # refused. If the key is still `restrict` without a forced command, these
+      # succeed and the run fails loudly here instead of a leak being discovered
+      # later. Opt-in per site, so the rollout order holds: workflow first,
+      # deploy green, then tighten the key, then switch this on.
+      - name: Prove the deploy key is forced to deploy.sh
+        if: inputs.verify-forced-command
+        run: |
+          set -euo pipefail
+          # All three probes write their output to a log file and fail on the
+          # first one that is *not* refused, so the refusal is both asserted and
+          # visible in the run.
+          log=prove-forced.log
+          : > "$log"
+          refuse() { # name
+            local name="$1"
+            local out
+            if out="$("${@:2}" 2>&1)"; then
+              echo "::error::$name was NOT refused — the deploy key is not forced to ${DEPLOY_SCRIPT}"
+              printf '%s\n' "$out" >> "$log"
+              exit 1
+            fi
+            echo "[$name] refused (exit != 0)" >> "$log"
+            printf '%s\n' "$out" >> "$log"
+          }
+
+          # 1. A shell command must not run.
+          refuse "'id'" ssh deploy-target "id"
+
+          # 2. Reading another site's compose must not work.
+          if [ -n "${{ inputs.verify-other-site-path }}" ]; then
+            refuse "read of another site's compose" \
+              ssh deploy-target "cat ${{ inputs.verify-other-site-path }}"
+          fi
+
+          # 3. scp must fail outright: it needs a remote scp process, which a
+          #    forced command will not start.
+          refuse "scp" scp -o BatchMode=yes deploy-target:/etc/hostname /tmp/forced-proof.txt
+
+          echo "== the deploy key is forced to ${DEPLOY_SCRIPT} =="
+          cat "$log"
 
       - name: Summary
         if: always()

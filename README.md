@@ -109,6 +109,8 @@ every site repository, so joining a new site needs no extra secret.
 | `deploy-script` | no       | `/srv/apps/<app-name>/deploy.sh` | The forced command on the site's key; reads a compose file on stdin, installs it, pulls, recreates and gates on health. |
 | `compose-file`  | no       | `infra/docker-compose.yml` | Path to the compose file in the calling repository.                 |
 | `image-tag`     | no       | the commit SHA             | Tag to publish and deploy. Override only for a deliberate re-tag.   |
+| `verify-forced-command` | no | `false`              | After deploying, use the site key to prove it is really forced to `deploy.sh`: a shell command, a read of another site's compose, and an `scp` must all be refused. Fails the run if any succeeds. Switch on only after the site's key has been re-minted with the forced command. |
+| `verify-other-site-path` | no | (empty)              | When `verify-forced-command` is true, the path on the server whose read must be refused — another site's compose file, the cross-site case a leaked key must not reach. |
 
 ### Secrets
 
@@ -171,7 +173,12 @@ makes two publishers race for one tag. Keep CI's build as a smoke test with
    image, which is the rollback anchor.
 4. **Check `https://<site-host>/healthz`** for `200 ok` over valid TLS. A green
    container is not a finished deploy.
-5. **Write a step summary** naming the image, its digest, the remote path, the
+5. **Prove the key is forced** (only with `verify-forced-command: true`): with
+   the site key in hand, attempt `id`, a read of another site's compose file
+   (see `verify-other-site-path`), and an `scp` — each must be refused, or the
+   run fails. This is what makes a leaked key harmless by construction, and it
+   is verified on every deploy, not once.
+6. **Write a step summary** naming the image, its digest, the remote path, the
    deploy script, the public health URL and the previous image.
 
 ### Rolling back
