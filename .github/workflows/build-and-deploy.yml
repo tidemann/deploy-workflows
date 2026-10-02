@@ -2,10 +2,22 @@ name: Build and deploy
 
 # Reusable deploy route for st44 sites.
 #
-# Build the image in CI, push it to GHCR tagged by commit SHA, then SSH to the
-# server and run compose there. The GHCR package stays private: the registry
-# credential lives on the host, in the deploy user's docker config, and never
-# travels through this workflow. CI never ships image bytes to the server.
+# Build the image in CI, push it to GHCR tagged by commit SHA, then send the
+# compose file to the server on stdin, where the site's own deploy.sh installs
+# it, pulls, recreates and gates on health. The GHCR package stays private: the
+# registry credential lives on the host, in the deploy user's docker config, and
+# never travels through this workflow. CI never ships image bytes to the server.
+#
+# One ssh call, on purpose. Each site's deploy key is installed with an SSH
+# forced command (`restrict,command="/srv/apps/<app-name>/deploy.sh"`), so it
+# can run that one script and nothing else: no `scp`, no `docker`, no shell,
+# and no reaching into another site's directory. A leaked DEPLOY_KEY can
+# therefore redeploy its own site and do nothing more.
+#
+# The command is still named in the ssh line even though the forced command
+# overrides it. That is deliberate: the same workflow works whether or not the
+# key has been tightened yet, so the workflow and the key can be switched in
+# either order without a broken deploy in between.
 #
 # Calling repos pin this by tag (@v1), never by @main — see README.md.
 #
@@ -38,6 +50,15 @@ on:
         description: >-
           Directory on the server that holds the compose file.
           Defaults to /srv/apps/<app-name>/infra.
+        required: false
+        type: string
+        default: ""
+      deploy-script:
+        description: >-
+          Path to the site's deploy.sh on the server — the forced command its
+          deploy key may run. It reads a compose file on stdin, installs it,
+          pulls, recreates and gates on health.
+          Defaults to /srv/apps/<app-name>/deploy.sh.
         required: false
         type: string
         default: ""
@@ -136,13 +157,17 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
-      - name: Resolve the remote directory
+      - name: Resolve the remote paths
         run: |
           set -euo pipefail
           dir='${{ inputs.remote-dir }}'
           [ -n "$dir" ] || dir="/srv/apps/${APP_NAME}/infra"
+          script='${{ inputs.deploy-script }}'
+          [ -n "$script" ] || script="/srv/apps/${APP_NAME}/deploy.sh"
           echo "REMOTE_DIR=$dir" >> "$GITHUB_ENV"
+          echo "DEPLOY_SCRIPT=$script" >> "$GITHUB_ENV"
           echo "$dir"
+          echo "$script"
 
       # One ssh alias, so the host and user are named once and no later step has
       # to re-interpolate a secret into a command line.
@@ -170,85 +195,37 @@ jobs:
           EOF
           chmod 600 ~/.ssh/config
 
-      # Rollback anchor: name the artifact running now, before replacing it.
-      # Recorded first so a later failure still leaves the previous image named.
-      - name: Record the currently deployed image
-        run: |
-          set -euo pipefail
-          # SC2029: the expansion is meant to happen here, on the runner —
-          # these values come from inputs, not from the remote host.
-          # shellcheck disable=SC2029
-          ssh deploy-target "docker inspect -f '{{.Config.Image}} {{.Image}}' '${APP_NAME}' 2>/dev/null || echo 'none (first deployment)'" \
-            | tee previous-image.txt
-
-      # `mkdir -p` creates infra/ on a first deploy and is a no-op afterwards, so
-      # nobody pre-creates it by hand. It cannot grant itself permission, so name
-      # the missing prerequisite out loud when that is what failed.
-      - name: Create the deploy directory
-        run: |
-          set -euo pipefail
-          # SC2029: the expansion is meant to happen here, on the runner —
-          # these values come from inputs, not from the remote host.
-          # shellcheck disable=SC2029
-          if ! ssh deploy-target "mkdir -p '${REMOTE_DIR}'"; then
-            echo "::error::could not create ${REMOTE_DIR} — the deploy user needs a writable parent directory"
-            exit 1
-          fi
-          # shellcheck disable=SC2029
-          ssh deploy-target "test -w '${REMOTE_DIR}'"
-
-      # The compose file names the image as ${IMAGE}; the .env beside it supplies
-      # the value. That is what lets one compose file serve every deploy while
-      # the tag stays immutable and per-commit.
-      - name: Ship the compose file
+      # The compose file names the image as ${IMAGE}. The host's deploy.sh reads
+      # the compose file on stdin and writes it into infra/, and it cannot see a
+      # runner-side .env — so render the concrete image into the file here, and
+      # the immutable per-commit tag still travels with the deploy.
+      - name: Render the deploy compose file
         run: |
           set -euo pipefail
           test -f "${COMPOSE_FILE_PATH}" || {
             echo "::error::compose file not found in this repository: ${COMPOSE_FILE_PATH}"
             exit 1
           }
-          scp "${COMPOSE_FILE_PATH}" "deploy-target:${REMOTE_DIR}/docker-compose.yml"
-          printf 'IMAGE=%s\n' "${IMAGE}" > deploy.env
-          scp deploy.env "deploy-target:${REMOTE_DIR}/.env"
+          # Resolve ${IMAGE:?...} and plain ${IMAGE} to the pushed tag.
+          sed -e "s|\${IMAGE:?[^}]*}|${IMAGE}|g" -e "s|\${IMAGE}|${IMAGE}|g" \
+            "${COMPOSE_FILE_PATH}" > deploy-compose.yml
+          test -s deploy-compose.yml
 
-      # The pull runs as the deploy user on the host, which holds the GHCR
-      # credential. That is the whole point of the SSH route.
-      - name: Pull and start
+      # Everything the host needs is in the compose file, so this is the whole
+      # deploy: ship it on stdin, and the site's deploy.sh installs it, keeps the
+      # previous one as docker-compose.yml.prev, pulls, recreates, prints the
+      # container state and runs the health gate. It exits non-zero if the
+      # container does not answer, which fails this job. Its output names the
+      # image it replaced — that is the rollback anchor.
+      - name: Deploy
         run: |
           set -euo pipefail
-          # SC2029: the expansion is meant to happen here, on the runner —
-          # these values come from inputs, not from the remote host.
+          # SC2029: the expansion is meant to happen here, on the runner.
           # shellcheck disable=SC2029
-          ssh deploy-target "cd '${REMOTE_DIR}' && docker compose pull && docker compose up -d --force-recreate"
-
-      - name: Show container state
-        run: |
-          set -euo pipefail
-          # SC2029: the expansion is meant to happen here, on the runner —
-          # these values come from inputs, not from the remote host.
-          # shellcheck disable=SC2029
-          ssh deploy-target "docker ps --filter name='${APP_NAME}' --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'"
-
-      # Checked by service name over the shared proxy network, not over loopback:
-      # container loopback belongs to that container, and the proxy reaches this
-      # service the same way this check does.
-      - name: Verify healthz on the proxy network
-        run: |
-          set -euo pipefail
-          ssh deploy-target APP_NAME="${APP_NAME}" bash -s <<'REMOTE'
-          set -uo pipefail
-          for i in $(seq 1 30); do
-            body="$(docker exec "$APP_NAME" wget -qO- "http://${APP_NAME}:80/healthz" 2>/dev/null || true)"
-            if [ "$(printf '%s' "$body" | tr -d '[:space:]')" = "ok" ]; then
-              echo "internal healthz: ok"
-              exit 0
-            fi
-            sleep 2
-          done
-          echo "$APP_NAME never answered ok on http://${APP_NAME}:80/healthz"
-          docker logs --tail 50 "$APP_NAME" 2>&1 || true
-          exit 1
-          REMOTE
+          if ! ssh deploy-target "${DEPLOY_SCRIPT}" < deploy-compose.yml | tee deploy.log; then
+            echo "::error::the deploy script on the host failed — see the log above"
+            exit 1
+          fi
 
       # Only true once the proxy has a vhost and a valid certificate for the
       # hostname. A green container is not a finished deploy.
@@ -279,6 +256,10 @@ jobs:
             echo "- Image: \`${IMAGE}\`"
             echo "- Digest: \`${{ needs.build.outputs.digest }}\`"
             echo "- Remote path: \`${REMOTE_DIR}\`"
+            echo "- Deploy script (forced command): \`${DEPLOY_SCRIPT}\`"
             echo "- Public health check: https://${SITE_HOST}/healthz"
-            echo "- Previous image (rollback anchor): \`$(cat previous-image.txt 2>/dev/null || echo unknown)\`"
+            echo "- Previous image (rollback anchor):"
+            echo '```'
+            grep '^previous-image:' deploy.log 2>/dev/null || echo 'previous-image: unknown (the deploy did not get that far)'
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
